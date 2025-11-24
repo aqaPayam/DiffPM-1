@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Union
+
 from models.schedule import cosine_beta_schedule
 from models.unet import ImprovedDiffusionUNet1D
 
@@ -23,8 +24,9 @@ class DiffusionModel(nn.Module):
         ddim_steps: Optional[int] = None,       # number of steps for DDIM (<= T). None -> T
         ddim_eta: float = 0.0,                  # 0 = deterministic DDIM
         normalize_per_feature: bool = False,    # enable z-score normalization buffers
-        # NEW: optional external context (e.g. LSTM) dimension
-        context_dim: int = 0,
+        # NEW: optional external context (e.g. from LSTM)
+        use_context: bool = False,
+        context_dim: Optional[int] = None,
     ):
         """
         Args (original):
@@ -41,9 +43,11 @@ class DiffusionModel(nn.Module):
             ddim_steps: number of inference steps for DDIM
             ddim_eta: stochasticity for DDIM (0 = deterministic)
             normalize_per_feature: if True, apply z-score per feature using buffers
-            context_dim: dimensionality of an optional context vector per window
-                         (B, context_dim), e.g. from an LSTM over previous windows.
-                         If 0, no external context is used (backward-compatible).
+
+            use_context: if True, the underlying UNet expects an additional
+                         context vector per sample (e.g. from an LSTM over windows).
+            context_dim: dimension of that external context vector. If None and
+                         use_context=True, defaults to time_emb_dim.
         """
         super().__init__()
         self.window_size = window_size
@@ -55,6 +59,9 @@ class DiffusionModel(nn.Module):
         self.ddim_steps = ddim_steps
         self.ddim_eta = float(ddim_eta)
         self.normalize_per_feature = normalize_per_feature
+
+        # context-related flags (for LSTM-style conditioning)
+        self.use_context = use_context
         self.context_dim = context_dim
 
         # noise schedule
@@ -77,14 +84,15 @@ class DiffusionModel(nn.Module):
             self.feat_mean = None
             self.feat_std = None
 
-        # diffusion model (1D U-Net) with optional context
+        # diffusion model (1D U-Net)
         self.model = ImprovedDiffusionUNet1D(
             in_channels=in_channels,
             window_size=window_size,
             time_emb_dim=time_emb_dim,
             base_channels=base_channels,
             n_res_blocks=n_res_blocks,
-            context_dim=context_dim,
+            use_context=self.use_context,
+            context_dim=self.context_dim,
         )
 
     # --------- normalization helpers ---------
@@ -120,7 +128,6 @@ class DiffusionModel(nn.Module):
         x0: torch.Tensor,
         start_idx: torch.LongTensor,
         series_len: torch.LongTensor,
-        # NEW: optional per-window context (B, context_dim)
         context: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -130,28 +137,20 @@ class DiffusionModel(nn.Module):
             x0:         (B, W, D) clean window
             start_idx:  (B,)
             series_len: (B,)
-            context:    (B, context_dim) or None
-                        Additional conditioning per window (e.g. LSTM summary).
-
-        Returns:
-            scalar MSE loss.
+            context:    (B, C_ctx), optional external context per window
+                        (e.g. LSTM hidden state). Only used if self.use_context=True.
         """
         assert x0.dim() == 3 and x0.size(2) == self.in_channels, \
             f'Expected input shape (B, W, {self.in_channels}), got {tuple(x0.shape)}'
 
-        B = x0.size(0)
-
-        if self.context_dim > 0:
-            if context is None:
-                raise ValueError(
-                    "DiffusionModel was initialized with context_dim > 0 "
-                    "but no `context` was provided to forward()."
-                )
-            assert context.dim() == 2 and context.size(0) == B and context.size(1) == self.context_dim, \
-                f"Expected context shape (B, {self.context_dim}), got {tuple(context.shape)}"
+        if self.use_context:
+            assert context is not None, "use_context=True but no context was provided"
+            assert context.dim() == 2 and context.size(0) == x0.size(0), \
+                f"context must be (B, C_ctx), got {tuple(context.shape)}"
 
         x0 = self._normalize(x0)  # normalize before noising if enabled
 
+        B = x0.size(0)
         device = x0.device
 
         # random timestep per example
@@ -191,18 +190,8 @@ class DiffusionModel(nn.Module):
             t:          (B,)
             start_idx:  (B,)
             series_len: (B,)
-            context:    (B, context_dim) or None
+            context:    (B, C_ctx), optional external context per window
         """
-        if self.context_dim > 0:
-            B = x_t.size(0)
-            if context is None:
-                raise ValueError(
-                    "DiffusionModel was initialized with context_dim > 0 "
-                    "but no `context` was provided to _predict_eps_from_model()."
-                )
-            assert context.dim() == 2 and context.size(0) == B and context.size(1) == self.context_dim, \
-                f"Expected context shape (B, {self.context_dim}), got {tuple(context.shape)}"
-
         model_out = self.model(x_t, t, start_idx, series_len, context=context)
         if self.use_v_prediction:
             # eps = sqrt(a_bar)*v + sqrt(1 - a_bar)*x_t
@@ -219,16 +208,15 @@ class DiffusionModel(nn.Module):
         start_idx: torch.LongTensor,
         series_len: torch.LongTensor,
         device: Optional[torch.device] = None,
-        # NEW: optional per-window context (B, context_dim)
         context: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        DDPM ancestral sampling for a single window per batch element.
+        Sample windows using DDPM ancestral sampling.
 
         Args:
             start_idx:  (B,)
             series_len: (B,)
-            context:    (B, context_dim) or None
+            context:    (B, C_ctx), optional; if provided, reused across timesteps
         """
         if device is None:
             device = self.betas.device
@@ -237,15 +225,12 @@ class DiffusionModel(nn.Module):
         series_len = series_len.to(device)
         B = start_idx.size(0)
 
-        if self.context_dim > 0:
-            if context is None:
-                raise ValueError(
-                    "DiffusionModel was initialized with context_dim > 0 "
-                    "but no `context` was provided to _sample_ddpm()."
-                )
+        if self.use_context and context is not None:
             context = context.to(device)
-            assert context.dim() == 2 and context.size(0) == B and context.size(1) == self.context_dim, \
-                f"Expected context shape (B, {self.context_dim}), got {tuple(context.shape)}"
+            assert context.dim() == 2 and context.size(0) == B, \
+                f"context must be (B, C_ctx), got {tuple(context.shape)}"
+        elif self.use_context and context is None:
+            raise ValueError("use_context=True but no context was provided to _sample_ddpm")
 
         x = torch.randn(B, self.window_size, self.in_channels, device=device)
 
@@ -286,16 +271,15 @@ class DiffusionModel(nn.Module):
         device: Optional[torch.device] = None,
         ddim_steps: Optional[int] = None,
         eta: Optional[float] = None,
-        # NEW: optional per-window context (B, context_dim)
         context: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        DDIM sampling for a single window per batch element.
+        Sample windows using DDIM.
 
         Args:
             start_idx:  (B,)
             series_len: (B,)
-            context:    (B, context_dim) or None
+            context:    (B, C_ctx), optional; if provided, reused across timesteps
         """
         if device is None:
             device = self.betas.device
@@ -308,15 +292,12 @@ class DiffusionModel(nn.Module):
         series_len = series_len.to(device)
         B = start_idx.size(0)
 
-        if self.context_dim > 0:
-            if context is None:
-                raise ValueError(
-                    "DiffusionModel was initialized with context_dim > 0 "
-                    "but no `context` was provided to _sample_ddim()."
-                )
+        if self.use_context and context is not None:
             context = context.to(device)
-            assert context.dim() == 2 and context.size(0) == B and context.size(1) == self.context_dim, \
-                f"Expected context shape (B, {self.context_dim}), got {tuple(context.shape)}"
+            assert context.dim() == 2 and context.size(0) == B, \
+                f"context must be (B, C_ctx), got {tuple(context.shape)}"
+        elif self.use_context and context is None:
+            raise ValueError("use_context=True but no context was provided to _sample_ddim")
 
         # choose timesteps (uniform spacing)
         if ddim_steps > self.T:
@@ -365,7 +346,6 @@ class DiffusionModel(nn.Module):
         start_idx: torch.LongTensor,
         series_len: torch.LongTensor,
         device: Optional[torch.device] = None,
-        # NEW: optional per-window context (B, context_dim)
         context: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
@@ -375,7 +355,10 @@ class DiffusionModel(nn.Module):
         Args:
             start_idx:  (B,)
             series_len: (B,)
-            context:    (B, context_dim) or None.
+            context:    (B, C_ctx), optional external context per window.
+                        For LSTM-based conditioning, this would typically be
+                        derived from previous windows and kept fixed while
+                        sampling the current window.
         """
         if self.sampler == "ddpm":
             return self._sample_ddpm(start_idx, series_len, device, context=context)
@@ -391,19 +374,16 @@ class DiffusionModel(nn.Module):
         shift: int,
         min_value: float,
         max_value: float,
-        device: torch.device = None,
-        # NEW: optional per-series context (B, context_dim)
-        context: Optional[torch.Tensor] = None,
+        device: torch.device = None
     ) -> torch.Tensor:
         """
         Sample a full series from start to end by sliding and averaging overlapping windows,
         using batched sampling instead of sequential per-window loops.
 
-        NOTE:
-            This method assumes a single context vector per series (B, context_dim),
-            and repeats it for all windows of that series. If you want an LSTM-style
-            context that evolves by window, you will typically implement a custom
-            sequential loop outside this method.
+        NOTE: this version does NOT make use of LSTM-style context across windows;
+        all windows are sampled independently (as in the original design). For
+        sequence-dependent conditioning, a separate sequential sampler would be
+        more appropriate.
 
         Args:
             start_idx: (B,) tensor of start positions
@@ -412,7 +392,6 @@ class DiffusionModel(nn.Module):
             min_value: float minimum valid value
             max_value: float maximum valid value
             device:    torch device (defaults to model's device)
-            context:   (B, context_dim) or None
 
         Returns:
             Tensor of shape (B, L, D) where L = end_idx - start_idx + 1
@@ -435,7 +414,7 @@ class DiffusionModel(nn.Module):
         if not (1 <= shift < self.window_size):
             raise ValueError(f"shift must be between 1 and {self.window_size-1}")
 
-        # Compute window start positions (use first series as reference)
+        # Compute window start positions (based on first sample)
         s0 = int(start_idx[0].item())
         e0 = s0 + L - 1
         positions = list(range(s0, e0 - self.window_size + 2, shift))
@@ -447,27 +426,8 @@ class DiffusionModel(nn.Module):
 
         series_len_tens = torch.full((B*num_windows,), L, dtype=torch.long, device=device)
 
-        # Expand context, if any, to match (B*num_windows, context_dim)
-        if self.context_dim > 0:
-            if context is None:
-                raise ValueError(
-                    "DiffusionModel was initialized with context_dim > 0 "
-                    "but no `context` was provided to sample_total()."
-                )
-            context = context.to(device)
-            assert context.dim() == 2 and context.size(0) == B and context.size(1) == self.context_dim, \
-                f"Expected context shape (B, {self.context_dim}), got {tuple(context.shape)}"
-            ctx_expanded = (
-                context
-                .unsqueeze(1)                             # (B, 1, context_dim)
-                .expand(B, num_windows, self.context_dim) # (B, num_windows, context_dim)
-                .reshape(B * num_windows, self.context_dim)
-            )
-        else:
-            ctx_expanded = None
-
-        # Run all windows in one batched call
-        x_win_batch = self.sample(ws_tensor, series_len_tens, device=device, context=ctx_expanded)
+        # Run all windows in one batched call (independent, no context)
+        x_win_batch = self.sample(ws_tensor, series_len_tens, device=device)
         # shape: (B*num_windows, W, D)
 
         # Reshape back: (B, num_windows, W, D)
