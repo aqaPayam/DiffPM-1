@@ -1,5 +1,6 @@
+# training/train.py
+
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
@@ -22,7 +23,7 @@ def train_model(
     device: torch.device,
     show_detail: bool = False,
     sample_interval: int = 5,
-    # NEW: generic sequence-context options
+    # sequence-context options
     use_seq_context: bool = False,
     context_encoder_type: str = "lstm",   # "rnn" | "gru" | "lstm" | "tcn" | "transformer"
     context_hidden_dim: int = 128,
@@ -35,23 +36,12 @@ def train_model(
     """
     Train a 1D DiffusionModel on the provided dataset.
 
-    Two modes:
-
-    1) Standard (use_seq_context=False, default):
-       - dataset yields dicts with:
-           'window':     (B, W, D) per batch
-           'start_idx':  (B,)
-           'series_len': (B,)
-       - Identical to original behavior (no context encoder).
-
-    2) Sequence-context mode (use_seq_context=True):
-       - dataset yields dicts where 'window' is a *sequence* of windows:
-           'window':     (B, S, W, D)
-           'start_idx':  (B, S) or (B,)
-           'series_len': (B, S) or (B,)
-       - A chosen context encoder ("rnn", "gru", "lstm", "tcn", "transformer")
-         runs over the S windows and produces context vectors passed into the
-         diffusion model as additional conditioning.
+    Returns:
+        model:          trained DiffusionModel
+        loss_history:   list of epoch losses
+        context_encoder (or None):
+            - None if use_seq_context=False
+            - nn.Module if use_seq_context=True
     """
     dataloader = DataLoader(
         dataset,
@@ -242,4 +232,4 @@ def train_model(
             plt.tight_layout()
             plt.show()
 
-    return model, loss_history
+    return model, loss_history, context_encoder
