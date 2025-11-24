@@ -1,14 +1,10 @@
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 
 from models.diffusion_model import DiffusionModel
-from models.lstm_context import WindowContextLSTM
 
-
-# ============================================================
-# 1) ORIGINAL TRAINING (no LSTM, single windows) – baseline
-# ============================================================
 
 def train_model(
     dataset,
@@ -25,22 +21,38 @@ def train_model(
     device: torch.device,
     show_detail: bool = False,
     sample_interval: int = 5,
+    # NEW: LSTM-related options
+    use_lstm: bool = False,
+    lstm_hidden_dim: int = 128,
+    lstm_num_layers: int = 1,
 ):
     """
-    Train a 1D DiffusionModel on a dataset of independent windows.
+    Train a 1D DiffusionModel on the provided dataset.
 
-    Expected dataset __getitem__ output:
-        {
-            "window":    (W, D),
-            "start_idx": scalar,
-            "series_len": scalar
-        }
+    Two modes:
 
-    Dataloader batch:
-        window:    (B, W, D)
-        start_idx: (B,)
-        series_len:(B,)
+    1) Standard (use_lstm=False, default):
+       - dataset is expected to yield dicts with:
+           'window':     (B, W, D) per batch
+           'start_idx':  (B,)
+           'series_len': (B,)
+       - This is identical to the original behavior.
+
+    2) LSTM mode (use_lstm=True):
+       - dataset is expected to yield dicts where 'window' is a *sequence of
+         windows* for each sample in the batch:
+           'window':     (B, S, W, D)
+           'start_idx':  (B, S) or (B,)   (if (B,), same value is broadcast)
+           'series_len': (B, S) or (B,)   (if (B,), same value is broadcast)
+       - An LSTM runs over the S windows for each series and produces a context
+         vector per window. This context is passed to the diffusion model as an
+         additional conditioning signal.
+
+    Returns:
+        model: trained DiffusionModel
+        loss_history: list of average training losses per epoch
     """
+    # Prepare DataLoader
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -48,7 +60,8 @@ def train_model(
         drop_last=True
     )
 
-    # Diffusion model WITHOUT context (context_dim=0)
+    # Instantiate the diffusion model
+    # If use_lstm=True, the model is told to expect an external context vector.
     model = DiffusionModel(
         window_size=window_size,
         in_channels=D,
@@ -57,285 +70,195 @@ def train_model(
         n_res_blocks=n_res_blocks,
         timesteps=timesteps,
         s=s,
-        context_dim=0,   # <-- important: no LSTM context here
+        use_context=use_lstm,
+        context_dim=lstm_hidden_dim if use_lstm else None,
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    loss_history = []
+    # Optional LSTM for window-sequence conditioning
+    if use_lstm:
+        # We embed each window by averaging over time, giving a D-dimensional
+        # vector per window, and feed that into the LSTM.
+        lstm = nn.LSTM(
+            input_size=D,
+            hidden_size=lstm_hidden_dim,
+            num_layers=lstm_num_layers,
+            batch_first=False,  # (S, B, input_size)
+        ).to(device)
 
+        # Joint optimizer over diffusion model + LSTM parameters
+        optimizer = torch.optim.Adam(
+            list(model.parameters()) + list(lstm.parameters()),
+            lr=lr
+        )
+    else:
+        lstm = None
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    loss_history = []
     data_length = len(dataset)
 
     for epoch in range(1, epochs + 1):
         model.train()
+        if lstm is not None:
+            lstm.train()
         running_loss = 0.0
 
         for batch in dataloader:
-            x0 = batch['window'].to(device).float()       # (B, W, D)
-            start_idx = batch['start_idx'].to(device)     # (B,)
-            series_len = batch['series_len'].to(device)   # (B,)
+            if not use_lstm:
+                # ===== STANDARD MODE: independent windows (original behavior) =====
+                x0 = batch['window'].to(device).float()       # (B, W, D)
+                start_idx = batch['start_idx'].to(device)     # (B,)
+                series_len = batch['series_len'].to(device)   # (B,)
 
-            optimizer.zero_grad()
-            loss = model(x0, start_idx, series_len)       # no context
-            loss.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                loss = model(x0, start_idx, series_len)       # context=None
+                loss.backward()
+                optimizer.step()
 
-            running_loss += loss.item()
+                running_loss += loss.item()
+
+            else:
+                # ===== LSTM MODE: sequences of windows =====
+                # Expect:
+                #   window:     (B, S, W, D)
+                #   start_idx:  (B, S) or (B,)
+                #   series_len: (B, S) or (B,)
+                x0_seq = batch['window'].to(device).float()   # (B, S, W, D)
+                assert x0_seq.dim() == 4, \
+                    f"With use_lstm=True, expected 'window' with 4 dims (B,S,W,D), got {tuple(x0_seq.shape)}"
+
+                B, S, W, D_ = x0_seq.shape
+                assert W == window_size, f"Expected window_size={window_size}, got {W}"
+                assert D_ == D, f"Expected D={D}, got {D_}"
+
+                start_idx = batch['start_idx'].to(device)
+                series_len = batch['series_len'].to(device)
+
+                # Normalize shapes of start_idx and series_len to (B, S)
+                if start_idx.dim() == 1:
+                    # Broadcast the same series-level start index to all windows in the sequence
+                    start_idx = start_idx.unsqueeze(1).expand(B, S)
+                elif start_idx.dim() == 2:
+                    assert start_idx.shape == (B, S)
+                else:
+                    raise ValueError(f"start_idx must be (B,) or (B,S), got {tuple(start_idx.shape)}")
+
+                if series_len.dim() == 1:
+                    series_len = series_len.unsqueeze(1).expand(B, S)
+                elif series_len.dim() == 2:
+                    assert series_len.shape == (B, S)
+                else:
+                    raise ValueError(f"series_len must be (B,) or (B,S), got {tuple(series_len.shape)}")
+
+                # --- LSTM context over the sequence of windows ---
+
+                # Simple window embedding: mean over time dimension → (B, S, D)
+                # This is one possible choice; you could replace it with a learned
+                # CNN-based encoder if desired.
+                window_repr = x0_seq.mean(dim=2)              # (B, S, D)
+
+                # LSTM expects input as (S, B, input_size)
+                lstm_in = window_repr.permute(1, 0, 2)        # (S, B, D)
+                lstm_out, _ = lstm(lstm_in)                   # (S, B, H)
+                # Back to (B, S, H)
+                context_seq = lstm_out.permute(1, 0, 2)       # (B, S, H)
+
+                # Flatten sequences so we can call DiffusionModel in a single batch
+                x0_flat = x0_seq.reshape(B * S, W, D)         # (B*S, W, D)
+                start_flat = start_idx.reshape(B * S)         # (B*S,)
+                series_flat = series_len.reshape(B * S)       # (B*S,)
+                context_flat = context_seq.reshape(B * S, lstm_hidden_dim)  # (B*S, H)
+
+                optimizer.zero_grad()
+                loss = model(x0_flat, start_flat, series_flat, context=context_flat)
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item()
 
         avg_loss = running_loss / len(dataloader)
         loss_history.append(avg_loss)
-        print(f"[BASE] Epoch {epoch}/{epochs} - Avg Loss: {avg_loss:.6f}")
 
-        # Sampling & plotting at intervals
-        if show_detail and (epoch % sample_interval == 0):
+        print(f"Epoch {epoch}/{epochs} - Avg Loss: {avg_loss:.6f}")
+
+        # === Sampling & plotting at intervals (only in standard mode for now) ===
+        if show_detail and (epoch % sample_interval == 0) and (not use_lstm):
+            # pick random index in [0, data_length)
             idx = torch.randint(0, data_length, (1,)).item()
             print("idx is : ", idx)
             example = dataset[idx]
-
-            real_window = example['window'].unsqueeze(0).to(device).float()  # (1, W, D)
-            start_ex = example['start_idx'].unsqueeze(0).to(device)          # (1,)
-            len_ex = example['series_len'].unsqueeze(0).to(device)           # (1,)
+            # example['window']: (W, D)
+            real_window = example['window'].unsqueeze(0).to(device).float()
+            # real_window shape: (1, W, D)
+            start_ex = example['start_idx'].unsqueeze(0).to(device)
+            # start_ex shape: (1,)
+            len_ex = example['series_len'].unsqueeze(0).to(device)
+            # len_ex shape: (1,)
 
             model.eval()
             with torch.no_grad():
-                sample = model.sample(start_ex, len_ex, device=device)       # (1, W, D)
+                sample = model.sample(start_ex, len_ex, device=device)
+                # sample shape: (1, W, D)
 
-            # Assuming D == 1 for plotting
-            real_np = real_window.squeeze(-1).squeeze(0).cpu().numpy()       # (W,)
-            sample_np = sample.squeeze(-1).squeeze(0).cpu().numpy()          # (W,)
+            # Convert to numpy 1D arrays for plotting (assumes D=1)
+            real_np = real_window.squeeze(-1).squeeze(0).cpu().numpy()   # (W,)
+            sample_np = sample.squeeze(-1).squeeze(0).cpu().numpy()      # (W,)
 
             plt.figure(figsize=(8, 4))
             plt.plot(real_np, label='Real Data')
             plt.plot(sample_np, label='Sampled Data', alpha=0.7)
-            plt.title(f'[BASE] Epoch {epoch} - Real vs. Sampled (idx={idx})')
+            plt.title(f'Epoch {epoch} - Real vs. Sampled (idx={idx})')
             plt.legend()
             plt.tight_layout()
             plt.show()
 
-    # Loss curve
+    # === After training: loss plot & full-series sampling (standard mode only) ===
     if show_detail:
         plt.figure(figsize=(8, 4))
         plt.plot(loss_history, marker='o')
-        plt.title('[BASE] Training Loss over Epochs')
+        plt.title('Training Loss over Epochs')
         plt.xlabel('Epoch')
         plt.ylabel('MSE Loss')
         plt.tight_layout()
         plt.show()
 
-        # Full-series sampling example
-        model.eval()
-        with torch.no_grad():
-            start_full = torch.tensor([1],   dtype=torch.long, device=device)
-            end_full   = torch.tensor([175], dtype=torch.long, device=device)
-            shift = min(window_size - 1, 9)
-
-            full_sample = model.sample_total(
-                start_full, end_full, shift,
-                min_value=-10, max_value=10,
-                device=device
-            )  # (1, L, D)
-
-        full_np = full_sample.squeeze(0).cpu().numpy()  # (L, D) or (L,)
-
-        plt.figure(figsize=(10, 4))
-        if full_np.ndim == 1 or full_np.shape[1] == 1:
-            series = full_np[:, 0] if full_np.ndim > 1 else full_np
-            plt.plot(series, label='Sampled')
-        else:
-            for d in range(full_np.shape[1]):
-                plt.plot(full_np[:, d], alpha=0.7, label=f'Channel {d}')
-        plt.title("[BASE] Full-Series Sampled Output (1 → 175)")
-        plt.xlabel("Time index")
-        plt.ylabel("Value")
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-    return model, loss_history
-
-
-# ============================================================
-# 2) NEW TRAINING WITH LSTM CONTEXT (sequences of windows)
-# ============================================================
-
-def train_model_with_lstm(
-    dataset,
-    window_size: int,
-    time_emb_dim: int,
-    base_channels: int,
-    n_res_blocks: int,
-    timesteps: int,
-    D: int,
-    s: float,
-    batch_size: int,
-    epochs: int,
-    lr: float,
-    device: torch.device,
-    lstm_hidden_dim: int,
-    lstm_num_layers: int = 1,
-    lstm_bidirectional: bool = False,
-    show_detail: bool = False,
-    sample_interval: int = 5,
-):
-    """
-    Train a DiffusionModel that is conditioned on an LSTM-based context
-    over sequences of windows.
-
-    Expected dataset __getitem__ output:
-        {
-            "windows":   (N, W, D),   # sequence of N clean windows for one series
-            "start_idx": (N,),        # start index of each window
-            "series_len": scalar or (N,)  # full series length(s)
-        }
-
-    Dataloader batch:
-        windows:   (B, N, W, D)
-        start_idx: (B, N)
-        series_len:(B,) or (B, N)
-    """
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True,
-    )
-
-    # 1) LSTM context model (window-level)
-    context_model = WindowContextLSTM(
-        in_channels=D,
-        window_size=window_size,
-        hidden_dim=lstm_hidden_dim,
-        num_layers=lstm_num_layers,
-        bidirectional=lstm_bidirectional,
-    ).to(device)
-
-    context_dim = context_model.context_dim  # dimension of per-window context
-
-    # 2) Diffusion model with context_dim > 0
-    diffusion_model = DiffusionModel(
-        window_size=window_size,
-        in_channels=D,
-        time_emb_dim=time_emb_dim,
-        base_channels=base_channels,
-        n_res_blocks=n_res_blocks,
-        timesteps=timesteps,
-        s=s,
-        context_dim=context_dim,  # <-- important: enables context input
-    ).to(device)
-
-    # Joint optimizer
-    optimizer = torch.optim.Adam(
-        list(diffusion_model.parameters()) + list(context_model.parameters()),
-        lr=lr,
-    )
-
-    loss_history = []
-
-    for epoch in range(1, epochs + 1):
-        diffusion_model.train()
-        context_model.train()
-        running_loss = 0.0
-
-        for batch in dataloader:
-            # Batch shapes:
-            # windows:   (B, N, W, D)
-            # start_idx: (B, N)
-            # series_len:(B,) or (B, N)
-            windows = batch["windows"].to(device).float()
-            start_idx = batch["start_idx"].to(device).long()
-            series_len = batch["series_len"].to(device).long()
-
-            B, N, W, D_ = windows.shape
-            assert W == window_size, f"Expected W={window_size}, got {W}"
-            assert D_ == D, f"Expected D={D}, got {D_}"
-
-            # --- 1) LSTM context per window ---
-            # ctx_seq: (B, N, context_dim)
-            ctx_seq = context_model(windows)
-
-            # --- 2) Choose which window to train on for each series ---
-            window_indices = torch.randint(0, N, (B,), device=device)  # (B,)
-
-            # x0: (B, W, D)
-            x0 = windows[torch.arange(B, device=device), window_indices]     # (B, W, D)
-            ctx = ctx_seq[torch.arange(B, device=device), window_indices]    # (B, context_dim)
-
-            # start indices for chosen windows
-            start_idx_n = start_idx[torch.arange(B, device=device), window_indices]  # (B,)
-
-            # series_len handling
-            if series_len.dim() == 1:
-                series_len_n = series_len  # (B,)
-            else:
-                series_len_n = series_len[torch.arange(B, device=device), window_indices]
-
-            optimizer.zero_grad()
-
-            # --- 3) Diffusion loss with LSTM context ---
-            loss = diffusion_model(
-                x0=x0,
-                start_idx=start_idx_n,
-                series_len=series_len_n,
-                context=ctx,
-            )
-
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-
-        avg_loss = running_loss / len(dataloader)
-        loss_history.append(avg_loss)
-        print(f"[LSTM] Epoch {epoch}/{epochs} - Avg Loss: {avg_loss:.6f}")
-
-        # Optional: visualize one example window
-        if show_detail and (epoch % sample_interval == 0):
-            diffusion_model.eval()
-            context_model.eval()
-
+        # Full-series sampling only makes sense in the original
+        # context-free-window setting. For LSTM mode you'd want a
+        # different, sequential sampling routine.
+        if not use_lstm:
+            model.eval()
             with torch.no_grad():
-                example = dataset[0]   # take first series
-                ex_windows = example["windows"].unsqueeze(0).to(device).float()  # (1, N, W, D)
-                ex_start = example["start_idx"].unsqueeze(0).to(device).long()   # (1, N)
+                # Define absolute range: start=0, end=175
+                start_full = torch.tensor([1],   dtype=torch.long, device=device)  # (1,)
+                end_full   = torch.tensor([175], dtype=torch.long, device=device)  # (1,)
+                shift = min(window_size - 1, 9)
 
-                ex_len = example["series_len"]
-                if torch.is_tensor(ex_len):
-                    ex_len = ex_len.to(device).long()
-                    if ex_len.dim() == 0:
-                        ex_len = ex_len.view(1)          # (1,)
-                    elif ex_len.dim() == 1:
-                        ex_len = ex_len[:1]              # (1,)
-                else:
-                    ex_len = torch.tensor([ex_len], dtype=torch.long, device=device)
+                # Sample the entire series: returns (1, L, D) with L = end - start + 1
+                full_sample = model.sample_total(
+                    start_full,
+                    end_full,
+                    shift,
+                    min_value=-10,
+                    max_value=10,
+                    device=device
+                )
 
-                _, N_ex, W_ex, D_ex = ex_windows.shape
+            full_np = full_sample.squeeze(0).cpu().numpy()  # (L, D) or (L,)
 
-                # Context for full sequence
-                ctx_seq_ex = context_model(ex_windows)  # (1, N_ex, context_dim)
-
-                # Choose last window for visualization
-                n_idx = N_ex - 1
-                x0_ex = ex_windows[0, n_idx]           # (W, D)
-                ctx_ex = ctx_seq_ex[0, n_idx].unsqueeze(0)  # (1, context_dim)
-                start_ex = ex_start[0, n_idx].unsqueeze(0)  # (1,)
-                len_ex = ex_len.view(1)                     # (1,)
-
-                sample = diffusion_model.sample(
-                    start_idx=start_ex,
-                    series_len=len_ex,
-                    device=device,
-                    context=ctx_ex,
-                )  # (1, W, D)
-
-            # Assume D == 1 for plotting
-            real_np = x0_ex.squeeze(-1).cpu().numpy()                     # (W,)
-            sample_np = sample.squeeze(0).squeeze(-1).cpu().numpy()      # (W,)
-
-            plt.figure(figsize=(8, 4))
-            plt.plot(real_np, label="Real Data")
-            plt.plot(sample_np, label="Sampled Data", alpha=0.7)
-            plt.title(f"[LSTM] Epoch {epoch} - Real vs Sampled (last window of example[0])")
+            plt.figure(figsize=(10, 4))
+            # Single-channel case
+            if full_np.ndim == 1 or full_np.shape[1] == 1:
+                series = full_np[:, 0] if full_np.ndim > 1 else full_np
+                plt.plot(series, label='Sampled')
+            else:
+                # Multi-channel case
+                for d in range(full_np.shape[1]):
+                    plt.plot(full_np[:, d], alpha=0.7, label=f'Channel {d}')
+            plt.title("Full-Series Sampled Output (0 → 175, shift=1)")
+            plt.xlabel("Time index")
+            plt.ylabel("Value")
             plt.legend()
             plt.tight_layout()
             plt.show()
 
-    return diffusion_model, context_model, loss_history
+    return model, loss_history
