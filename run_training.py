@@ -1,3 +1,5 @@
+# run_training.py
+
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -23,7 +25,7 @@ def run_training(
     device: torch.device,
     show_detail: bool = False,
     sample_interval: int = 5,
-    # NEW: sequence-context options
+    # sequence-context options
     use_seq_context: bool = False,
     context_encoder_type: str = "lstm",   # "rnn" | "gru" | "lstm" | "tcn" | "transformer"
     context_hidden_dim: int = 128,
@@ -33,17 +35,15 @@ def run_training(
     tcn_kernel_size: int = 3,
     transformer_nhead: int = 4,
     context_dropout: float = 0.0,
-) -> tuple[torch.nn.Module, torch.nn.Module]:
+):
     """
     End-to-end training for trend and residual diffusion models.
 
-    If use_seq_context=False (default):
-        - Uses WindowDataset (independent windows, no context encoder).
-
-    If use_seq_context=True:
-        - Uses SequenceWindowDataset (sequences of windows).
-        - Uses chosen context encoder type:
-          "rnn", "gru", "lstm", "tcn", or "transformer".
+    Returns:
+        trend_model
+        trend_context_encoder (or None)
+        residual_model
+        residual_context_encoder (or None)
     """
     # 1) Load raw data: shape (N, T, D)
     arr = np.load(data_npy)
@@ -117,7 +117,7 @@ def run_training(
 
     # 9) Train trend model
     print("Training TREND model...")
-    trend_model, trend_loss = train_model(
+    trend_model, trend_loss, trend_context_encoder = train_model(
         dataset=trend_dataset,
         window_size=window_size,
         time_emb_dim=time_emb_dim,
@@ -143,7 +143,7 @@ def run_training(
 
     # 10) Train residual model
     print("Training RESIDUAL model...")
-    resid_model, resid_loss = train_model(
+    residual_model, residual_loss, residual_context_encoder = train_model(
         dataset=resid_dataset,
         window_size=window_size,
         time_emb_dim=time_emb_dim,
@@ -167,4 +167,4 @@ def run_training(
         context_dropout=context_dropout,
     )
 
-    return trend_model, resid_model
+    return trend_model, trend_context_encoder, residual_model, residual_context_encoder
